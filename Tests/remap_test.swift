@@ -1,0 +1,98 @@
+import ApplicationServices
+import Cocoa
+
+// 端到端验证工具：
+// 1. 创建一个被动（listenOnly）事件 tap，追加在 tap 链尾部，观察被 CapsJ4Mac 改写之后的事件
+// 2. 向系统注入合成按键事件（Caps 按下/抬起、A 按下/抬起、F13 按下/抬起）
+// 3. 校验：Caps 事件被吞掉、Caps+A 变成 ←（123）、未映射的 F13 保持原样（105）
+
+var recorded: [(CGEventType, Int64, CGEventFlags)] = []
+
+func recordCallback(
+    proxy _: CGEventTapProxy,
+    type: CGEventType,
+    event: CGEvent,
+    refcon _: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    if type == .keyDown || type == .keyUp || type == .flagsChanged {
+        recorded.append((type, event.getIntegerValueField(.keyboardEventKeycode), event.flags))
+    }
+    return Unmanaged.passUnretained(event)
+}
+
+let mask: CGEventMask =
+    (CGEventMask(1) << CGEventType.keyDown.rawValue)
+        | (CGEventMask(1) << CGEventType.keyUp.rawValue)
+        | (CGEventMask(1) << CGEventType.flagsChanged.rawValue)
+
+guard let tap = CGEvent.tapCreate(
+    tap: .cgSessionEventTap,
+    place: .tailAppendEventTap,
+    options: .listenOnly,
+    eventsOfInterest: mask,
+    callback: recordCallback,
+    userInfo: nil
+) else {
+    FileHandle.standardError.write("错误：无法创建监听 tap，本测试工具也需要辅助功能权限\n".data(using: .utf8)!)
+    exit(1)
+}
+let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+CGEvent.tapEnable(tap: tap, enable: true)
+
+let src = CGEventSource(stateID: .hidSystemState)
+
+func postKey(_ keyCode: Int64, down: Bool, flags: CGEventFlags = []) {
+    let event = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(keyCode), keyDown: down)!
+    event.flags = flags
+    event.post(tap: .cghidEventTap)
+    usleep(150_000) // 事件间隔，保证时序
+}
+
+func capsStateOn() -> Bool {
+    CGEventSource.flagsState(.hidSystemState).contains(.maskAlphaShift)
+}
+
+print("3 秒后开始注入测试事件，期间请勿触碰键盘…")
+sleep(3)
+
+let capsBefore = capsStateOn()
+
+postKey(57, down: true, flags: .maskAlphaShift) // Caps 按下
+postKey(0, down: true) // Caps+A 按下  -> 期望改写为 ← (123)
+postKey(0, down: false) // Caps+A 抬起 -> 期望改写为 ← (123)
+postKey(57, down: false, flags: []) // Caps 抬起
+postKey(105, down: true) // 单独 F13 按下 -> 期望原样 (105)
+postKey(105, down: false)
+
+// 让事件流转一会儿
+let deadline = Date().addingTimeInterval(1.0)
+while Date() < deadline {
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+}
+
+print("\n=== 捕获到的事件 ===")
+for (type, keyCode, flags) in recorded {
+    let name = type == .keyDown ? "keyDown " : type == .keyUp ? "keyUp   " : "flagsCh "
+    print("\(name) keyCode=\(keyCode) flags=0x\(String(flags.rawValue, radix: 16))")
+}
+
+var pass = true
+func check(_ cond: Bool, _ msg: String) {
+    print("\(cond ? "PASS" : "FAIL"): \(msg)")
+    if !cond { pass = false }
+}
+
+let capsEvents = recorded.filter { $0.1 == 57 }
+let aDown = recorded.first { $0.0 == .keyDown && $0.1 != 105 }
+let aUp = recorded.first { $0.0 == .keyUp && $0.1 != 105 }
+let f13 = recorded.filter { $0.1 == 105 }
+
+check(capsEvents.isEmpty, "Caps Lock 事件被吞掉（未观察到 keyCode 57）")
+check(aDown?.1 == 123, "Caps+A 按下被改写为 ←（keyCode 123），实际：\(aDown?.1 ?? -1)")
+check(aUp?.1 == 123, "Caps+A 抬起被改写为 ←（keyCode 123），实际：\(aUp?.1 ?? -1)")
+check(f13.count == 2, "未映射键 F13 原样透传（down+up 共 2 个事件），实际：\(f13.count)")
+check(capsStateOn() == capsBefore, "测试前后系统大写锁定状态未变化（\(capsBefore) -> \(capsStateOn())）")
+
+print(pass ? "\n全部通过 ✅" : "\n存在失败项 ❌")
+exit(pass ? 0 : 1)

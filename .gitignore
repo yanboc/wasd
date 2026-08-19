@@ -1,0 +1,8 @@
+# 构建产物
+CapsJ4Mac.app/
+Tests/remap_test
+Tests/clear_caps
+Tests/event_log
+
+# macOS
+.DS_Store
