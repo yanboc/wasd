@@ -1,5 +1,6 @@
 # 构建产物
 CapsJ4Mac.app/
+dist/
 Tests/remap_test
 Tests/clear_caps
 Tests/event_log

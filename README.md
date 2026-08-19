@@ -2,6 +2,19 @@
 
 轻量级 macOS 键盘映射工具：把 Caps Lock 变成纯导航修饰键。
 
+作者：yanboc，由 [Kimi Code](https://github.com/MoonshotAI/kimi-code) 辅助开发。
+
+## 下载
+
+从 [Releases](https://github.com/yanboc/capsj4mac/releases) 下载最新的 `CapsJ4Mac-x.y.z.dmg`，打开后将 `CapsJ4Mac.app` 拖入 `Applications`。
+
+本应用使用 ad-hoc 签名（未做 Apple 公证），首次打开会被 Gatekeeper 拦截，任选其一：
+
+- 在 `应用程序` 文件夹中**右键 CapsJ4Mac.app → 打开**，再点"打开"
+- 或终端执行：`xattr -dr com.apple.quarantine /Applications/CapsJ4Mac.app`
+
+首次启动还需授予两项权限（系统设置 → 隐私与安全性）：**辅助功能**（事件拦截）和**输入监控**（Caps 物理按键状态监听），授权后自动开始工作。
+
 ## 功能
 
 | 按键 | 效果 |
@@ -25,13 +38,14 @@ make run     # 构建并启动
 make clean
 ```
 
-## 首次运行：授予辅助功能权限
+## 首次运行：授予权限
 
-事件拦截依赖"辅助功能"权限。首次启动时系统会弹出授权提示；也可手动前往：
+需要两项权限（系统设置 → 隐私与安全性）：
 
-**系统设置 → 隐私与安全性 → 辅助功能 → 打开 CapsJ4Mac 的开关**
+- **辅助功能**：键盘事件拦截与改写
+- **输入监控**：IOHIDManager 监听 Caps 物理按下/抬起
 
-授权后应用自动开始工作（应用每 2 秒轮询一次权限状态，无需重启）。菜单栏图标亮起表示映射生效，置灰表示暂停或等待授权。
+首次启动会自动弹窗引导授权，授权后应用自动开始工作（应用每 2 秒轮询一次权限状态，无需重启）。菜单栏图标亮起表示映射生效，置灰表示暂停或等待授权。
 
 ## 使用
 
