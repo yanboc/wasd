@@ -1,4 +1,4 @@
-# CapsJ4Mac
+# WASD
 
 轻量级 macOS 键盘映射工具：把 Caps Lock 变成纯导航修饰键。
 
