@@ -1,5 +1,7 @@
 APP := WASD.app
 BIN := $(APP)/Contents/MacOS/WASD
+# 不写 -target 时，当前工具链会把最低系统标成 28.0，在 macOS 27 上无法打开。
+TARGET := $(shell uname -m)-apple-macosx13.0
 
 # 自签名代码签名证书（make cert 生成）。固定身份让 TCC 权限跨构建、跨重启保持稳定；
 # 证书不存在时回退 ad-hoc 签名（--sign -），但每次重编译都可能要重新授权。
@@ -8,7 +10,7 @@ SIGN := $(shell security find-identity -p codesigning 2>/dev/null | grep -q "$(C
 
 build:
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
-	swiftc -O -import-objc-header Sources/WASD-Bridging-Header.h -o $(BIN) Sources/main.swift Sources/capslock.c -framework IOKit -framework Carbon
+	swiftc -O -target $(TARGET) -import-objc-header Sources/WASD-Bridging-Header.h -o $(BIN) Sources/main.swift Sources/capslock.c -framework IOKit -framework Carbon
 	cp Info.plist $(APP)/Contents/Info.plist
 	cp Resources/AppIcon.icns $(APP)/Contents/Resources/AppIcon.icns
 	codesign --sign "$(SIGN)" --force --deep $(APP)
@@ -42,7 +44,7 @@ run: build
 	open $(APP)
 
 test: build
-	swiftc -O -o Tests/remap_test Tests/remap_test.swift
+	swiftc -O -target $(TARGET) -o Tests/remap_test Tests/remap_test.swift
 	codesign --sign "$(SIGN)" --force --identifier local.wasd.remap-test Tests/remap_test
 	pkill -x WASD || true
 	pkill -x CapsJ4Mac || true
