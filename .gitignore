@@ -1,4 +1,5 @@
 # 构建产物
+WASD.app/
 CapsJ4Mac.app/
 dist/
 Tests/remap_test

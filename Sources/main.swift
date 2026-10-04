@@ -1,4 +1,5 @@
 import ApplicationServices
+import Carbon.HIToolbox
 import Cocoa
 import IOKit.hid
 
@@ -6,6 +7,20 @@ import IOKit.hid
 
 /// Caps Lock 的虚拟键码
 private let capsLockKeyCode: Int64 = 57
+private let leftShiftKeyCode: Int64 = 56
+private let rightShiftKeyCode: Int64 = 60
+/// 短于此时长、且没有其他键的 Shift 视为切换中英文，而不是修饰键
+private let shiftTapThreshold: TimeInterval = 0.3
+/// 定时器补发的 Shift 事件带上此标记，避免回调把补发又当成一次新按下
+private let syntheticMarker: Int64 = 0x57415344
+
+/// 一次尚未结束的 Shift 按下。consumed 为真表示它已经要当修饰键用。
+final class ShiftTap {
+    let keyCode: Int64
+    var consumed = false
+    var commitWork: DispatchWorkItem?
+    init(keyCode: Int64) { self.keyCode = keyCode }
+}
 
 /// 按住 Caps 期间的映射表：物理键码 -> 目标键码
 private let keyMap: [Int64: Int64] = [
@@ -32,6 +47,8 @@ final class RemapController {
     var capsHeld = false
     /// 已按下且被映射的物理键集合：保证抬起事件仍发改写后的键码，即使 Caps 已先松开
     var activeMappedKeys = Set<Int64>()
+    /// 当前这下 Shift 还没抬起。nil 表示 Shift 未处于“待判定”状态
+    var shiftTap: ShiftTap?
     /// 键盘事件 tap
     var eventTap: CFMachPort?
     /// tap 对应的 runloop source（重建 tap 时需一并移除）
@@ -50,6 +67,8 @@ final class RemapController {
     func resetState() {
         capsHeld = false
         activeMappedKeys.removeAll()
+        shiftTap?.commitWork?.cancel()
+        shiftTap = nil
     }
 }
 
@@ -62,6 +81,11 @@ private func eventTapCallback(
     refcon _: UnsafeMutableRawPointer?
 ) -> Unmanaged<CGEvent>? {
     let controller = RemapController.shared
+
+    // 定时器补发的修饰键事件原样下发，不再进入短按判定
+    if event.getIntegerValueField(.eventSourceUserData) == syntheticMarker {
+        return Unmanaged.passUnretained(event)
+    }
 
     // 系统因超时等原因禁用 tap 时先原地恢复，失败则整体重建
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -100,15 +124,32 @@ private func eventTapCallback(
         // 按住状态由 IOHIDManager 提供；这里只吞掉事件并复位驱动层的大写锁定。
         if keyCode == capsLockKeyCode {
             controller.capsFlagsSeen += 1
-            if ProcessInfo.processInfo.environment["CAPSJ4MAC_TAP_STATE"] == "1" {
-                // 仅供自动化测试（合成事件不经过 HID 层）：CAPSJ4MAC_TAP_STATE=1 时由 tap 代管状态
+            if ProcessInfo.processInfo.environment["WASD_TAP_STATE"] == "1" {
+                // 仅供自动化测试（合成事件不经过 HID 层）：WASD_TAP_STATE=1 时由 tap 代管状态
                 controller.capsHeld = event.flags.contains(.maskAlphaShift)
             }
             clearCapsLockState()
             return nil
         }
-        // Shift 等其他修饰键透传
+        if isShiftKey(keyCode) {
+            return handleShift(controller, event, keyCode)
+        }
+        // Command / Option / Control 与 Shift 同时按下时，Shift 就是修饰键
+        if controller.shiftTap != nil {
+            markShiftAsModifier(controller)
+            event.flags.insert(.maskShift)
+        }
         return Unmanaged.passUnretained(event)
+    }
+
+    if isMouseButton(type), controller.shiftTap != nil {
+        markShiftAsModifier(controller)
+        event.flags.insert(.maskShift)
+        return Unmanaged.passUnretained(event)
+    }
+
+    if type == .keyDown || type == .keyUp {
+        noteKeyWhileShiftHeld(controller, event)
     }
 
     // Caps 按住期间剥离大写标记，防止 HID 层锁定状态把字母大写化
@@ -135,6 +176,93 @@ private func eventTapCallback(
     return Unmanaged.passUnretained(event)
 }
 
+private func isShiftKey(_ keyCode: Int64) -> Bool {
+    keyCode == leftShiftKeyCode || keyCode == rightShiftKeyCode
+}
+
+private func isMouseButton(_ type: CGEventType) -> Bool {
+    switch type {
+    case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
+        return true
+    default:
+        return false
+    }
+}
+
+/// 这下 Shift 已经配了别的键，取消“短按切换”并作废到点补发
+private func markShiftAsModifier(_ controller: RemapController) {
+    guard let tap = controller.shiftTap, !tap.consumed else { return }
+    tap.consumed = true
+    tap.commitWork?.cancel()
+}
+
+/// 按住超过阈值后，把刚才吞掉的 Shift 按下补发给系统（在回调之外调用，避免死锁）
+private func commitShiftHold(_ controller: RemapController) {
+    guard let tap = controller.shiftTap, !tap.consumed else { return }
+    tap.consumed = true
+    postShiftFlags(keyCode: tap.keyCode, flags: .maskShift)
+}
+
+private func postShiftFlags(keyCode: Int64, flags: CGEventFlags) {
+    let source = CGEventSource(stateID: .hidSystemState)
+    guard let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(keyCode), keyDown: true) else { return }
+    event.type = .flagsChanged
+    event.flags = flags
+    event.setIntegerValueField(.eventSourceUserData, value: syntheticMarker)
+    event.post(tap: .cghidEventTap)
+}
+
+/// 短按：吞掉按下与抬起，并切换输入源。组合或长按：抬起照常下发，按下在到点后补发。
+private func shiftKeyIsDown(_ event: CGEvent, _ keyCode: Int64) -> Bool {
+    // 左右 Shift 的设备位。总的 maskShift 在另一侧仍按住时不会清掉，不能用来判断这一颗键。
+    let deviceBit: UInt64 = keyCode == leftShiftKeyCode ? 0x0002 : 0x0004
+    if event.flags.rawValue & deviceBit != 0 { return true }
+    if RemapController.shared.shiftTap?.keyCode == keyCode { return false }
+    return event.flags.contains(.maskShift)
+}
+
+private func handleShift(_ controller: RemapController, _ event: CGEvent, _ keyCode: Int64) -> Unmanaged<CGEvent>? {
+    let shiftIsDown = shiftKeyIsDown(event, keyCode)
+    if shiftIsDown {
+        if controller.shiftTap != nil {
+            markShiftAsModifier(controller)
+            return Unmanaged.passUnretained(event)
+        }
+        let tap = ShiftTap(keyCode: keyCode)
+        let work = DispatchWorkItem {
+            commitShiftHold(controller)
+        }
+        tap.commitWork = work
+        controller.shiftTap = tap
+        DispatchQueue.main.asyncAfter(deadline: .now() + shiftTapThreshold, execute: work)
+        return nil
+    }
+
+    guard let tap = controller.shiftTap, tap.keyCode == keyCode else {
+        return Unmanaged.passUnretained(event)
+    }
+    let otherMods = event.flags.intersection([.maskCommand, .maskAlternate, .maskControl])
+    if !otherMods.isEmpty || !controller.activeMappedKeys.isEmpty {
+        tap.consumed = true
+    }
+    controller.shiftTap = nil
+    tap.commitWork?.cancel()
+    if !tap.consumed, !controller.capsHeld {
+        // 放到回调之外，避免在事件 tap 里同步切输入源时重入
+        DispatchQueue.main.async {
+            InputSwitcher.toggle()
+        }
+        return nil
+    }
+    return Unmanaged.passUnretained(event)
+}
+
+private func noteKeyWhileShiftHeld(_ controller: RemapController, _ event: CGEvent) {
+    guard controller.shiftTap != nil else { return }
+    markShiftAsModifier(controller)
+    event.flags.insert(.maskShift)
+}
+
 private func setupEventTap() -> Bool {
     guard RemapController.shared.eventTap == nil else { return true }
 
@@ -142,6 +270,12 @@ private func setupEventTap() -> Bool {
         (CGEventMask(1) << CGEventType.keyDown.rawValue)
             | (CGEventMask(1) << CGEventType.keyUp.rawValue)
             | (CGEventMask(1) << CGEventType.flagsChanged.rawValue)
+            | (CGEventMask(1) << CGEventType.leftMouseDown.rawValue)
+            | (CGEventMask(1) << CGEventType.leftMouseUp.rawValue)
+            | (CGEventMask(1) << CGEventType.rightMouseDown.rawValue)
+            | (CGEventMask(1) << CGEventType.rightMouseUp.rawValue)
+            | (CGEventMask(1) << CGEventType.otherMouseDown.rawValue)
+            | (CGEventMask(1) << CGEventType.otherMouseUp.rawValue)
 
     guard let tap = CGEvent.tapCreate(
         tap: .cgSessionEventTap,
@@ -245,15 +379,101 @@ private func hasInputMonitoringAccess() -> Bool {
     IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
 }
 
+// MARK: - 中英文输入源
+
+private enum InputSwitcher {
+    private static let lastChineseKey = "lastChineseInputSourceID"
+    private static let lastEnglishKey = "lastEnglishInputSourceID"
+    private static let abcSourceID = "com.apple.keylayout.ABC"
+
+    static func toggle() {
+        let sources = enabledSources()
+        guard let current = currentSource() else {
+            log("短按 Shift：读取当前输入源失败")
+            return
+        }
+        if current.isChinese {
+            UserDefaults.standard.set(current.id, forKey: lastChineseKey)
+            let savedEnglish = UserDefaults.standard.string(forKey: lastEnglishKey)
+            guard let english = sources.first(where: { $0.id == savedEnglish })
+                ?? sources.first(where: { $0.id == abcSourceID })
+                ?? sources.first(where: { !$0.isChinese && $0.id != current.id })
+            else {
+                log("短按 Shift：没有可切换的英文输入源")
+                return
+            }
+            select(english, from: current.id)
+        } else {
+            UserDefaults.standard.set(current.id, forKey: lastEnglishKey)
+            let savedChinese = UserDefaults.standard.string(forKey: lastChineseKey)
+            guard let chinese = sources.first(where: { $0.id == savedChinese })
+                ?? sources.first(where: { $0.isChinese })
+            else {
+                log("短按 Shift：没有可切换的中文输入源")
+                return
+            }
+            select(chinese, from: current.id)
+        }
+    }
+
+    private static func select(_ source: InputSource, from previousID: String) {
+        guard source.id != previousID else { return }
+        let status = TISSelectInputSource(source.ref)
+        log("短按 Shift：输入源 \(previousID) -> \(source.id)（\(status)）")
+    }
+
+    private static func currentSource() -> InputSource? {
+        guard let ref = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return nil }
+        return InputSource(ref: ref)
+    }
+
+    private static func enabledSources() -> [InputSource] {
+        let filter = [
+            kTISPropertyInputSourceCategory!: kTISCategoryKeyboardInputSource!,
+            kTISPropertyInputSourceIsSelectCapable!: kCFBooleanTrue!,
+        ] as CFDictionary
+        guard let list = TISCreateInputSourceList(filter, false)?.takeRetainedValue() else { return [] }
+        return (0 ..< CFArrayGetCount(list)).compactMap { index in
+            guard let raw = CFArrayGetValueAtIndex(list, index) else { return nil }
+            // 列表释放后仍要拿住这份输入源，直到切换完成
+            let ref = Unmanaged<TISInputSource>.fromOpaque(raw).retain().takeRetainedValue()
+            return InputSource(ref: ref)
+        }
+    }
+}
+
+private struct InputSource {
+    let ref: TISInputSource
+
+    var id: String {
+        stringProperty(kTISPropertyInputSourceID) ?? ""
+    }
+
+    var isChinese: Bool {
+        languages.first?.hasPrefix("zh") == true
+    }
+
+    private var languages: [String] {
+        guard let ptr = TISGetInputSourceProperty(ref, kTISPropertyInputSourceLanguages) else { return [] }
+        let value = Unmanaged<CFArray>.fromOpaque(ptr).takeUnretainedValue()
+        return value as? [String] ?? []
+    }
+
+    private func stringProperty(_ key: CFString) -> String? {
+        guard let ptr = TISGetInputSourceProperty(ref, key) else { return nil }
+        return Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
+    }
+}
+
 // MARK: - 日志
 
-/// 日志同时写 stderr 与 ~/Library/Logs/CapsJ4Mac.log；
+/// 日志同时写 stderr 与 ~/Library/Logs/WASD.log；
 /// 登录项启动时 stderr 无处可去，文件日志是排查自启问题的唯一途径。
 private let logURL: URL = {
     let dir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Logs")
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.appendingPathComponent("CapsJ4Mac.log")
+    return dir.appendingPathComponent("WASD.log")
 }()
 
 private let logDateFormatter: DateFormatter = {
@@ -291,16 +511,21 @@ final class PermissionGuideWindowController: NSWindowController, NSWindowDelegat
     private let imButton = NSButton(title: "去授权", target: nil, action: nil)
     private let doneLabel = NSTextField(labelWithString: "")
     private var pollTimer: Timer?
+    private var didPromptInputMonitoring = false
     /// 两项权限全部授予后回调（启动事件监听）
     var onAllGranted: (() -> Void)?
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 440, height: 260),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 340),
             styleMask: [.titled, .closable],
             backing: .buffered, defer: false
         )
-        window.title = "欢迎使用 CapsJ4Mac"
+        window.title = "欢迎使用 WASD"
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.hidesOnDeactivate = false
         window.center()
         super.init(window: window)
         window.delegate = self
@@ -341,9 +566,14 @@ final class PermissionGuideWindowController: NSWindowController, NSWindowDelegat
         titleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
 
         let descLabel = NSTextField(wrappingLabelWithString:
-            "点击每项右侧的“去授权”，系统会弹出授权请求并可直接跳转到对应设置页，打开 CapsJ4Mac 的开关即可。授权只需这一次，之后重启、升级都有效。")
+            "点“去授权”后，系统设置会打开到「隐私与安全性」。在辅助功能、输入监控两页里打开 WASD 的开关。若列表里没有 WASD，点页面左下角的 + ，选中下面这个应用。")
         descLabel.font = .systemFont(ofSize: 12)
         descLabel.textColor = .secondaryLabelColor
+
+        let pathLabel = NSTextField(wrappingLabelWithString: Bundle.main.bundleURL.path)
+        pathLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        pathLabel.textColor = .secondaryLabelColor
+        pathLabel.isSelectable = true
 
         let axRow = permissionRow(title: "辅助功能", detail: "拦截并改写键盘事件",
                                   status: axStatus, button: axButton, action: #selector(grantAccessibility))
@@ -353,7 +583,7 @@ final class PermissionGuideWindowController: NSWindowController, NSWindowDelegat
         doneLabel.font = .systemFont(ofSize: 12)
         doneLabel.alignment = .center
 
-        let stack = NSStackView(views: [titleLabel, descLabel, axRow, imRow, doneLabel])
+        let stack = NSStackView(views: [titleLabel, descLabel, pathLabel, axRow, imRow, doneLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
@@ -366,18 +596,28 @@ final class PermissionGuideWindowController: NSWindowController, NSWindowDelegat
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor),
             descLabel.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48),
+            pathLabel.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48),
             axRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48),
             imRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -48),
         ])
     }
 
     func show() {
+        // 菜单栏应用平时不占 Dock。授权期间改成普通应用，窗口才能盖到最前面。
+        NSApp.setActivationPolicy(.regular)
         showWindow(nil)
+        window?.center()
         window?.makeKeyAndOrderFront(nil)
-        // LSUIElement 应用默认不前置，需主动激活
         NSApp.activate(ignoringOtherApps: true)
         startPolling()
         refreshStatus()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.window?.orderFrontRegardless()
+            if !AXIsProcessTrustedWithOptions([axPromptKey: false] as CFDictionary) {
+                self.grantAccessibility()
+            }
+        }
     }
 
     @objc private func grantAccessibility() {
@@ -393,9 +633,18 @@ final class PermissionGuideWindowController: NSWindowController, NSWindowDelegat
     }
 
     private func openSettingsPane(_ anchor: String) {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
-            NSWorkspace.shared.open(url)
+        let candidates = [
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(anchor)",
+            "x-apple.systempreferences:com.apple.preference.security?\(anchor)",
+        ]
+        for raw in candidates {
+            guard let url = URL(string: raw) else { continue }
+            if NSWorkspace.shared.open(url) {
+                log("已打开系统设置：\(anchor)")
+                return
+            }
         }
+        log("未能打开系统设置页：\(anchor)")
     }
 
     private func startPolling() {
@@ -417,6 +666,11 @@ final class PermissionGuideWindowController: NSWindowController, NSWindowDelegat
         markGranted(axStatus, axButton, axGranted)
         markGranted(imStatus, imButton, imGranted)
 
+        if axGranted, !imGranted, !didPromptInputMonitoring {
+            didPromptInputMonitoring = true
+            grantInputMonitoring()
+        }
+
         if axGranted, imGranted {
             doneLabel.stringValue = "✓ 两项权限均已授予，即将开始…"
             doneLabel.textColor = .systemGreen
@@ -434,6 +688,7 @@ final class PermissionGuideWindowController: NSWindowController, NSWindowDelegat
     func windowWillClose(_: Notification) {
         pollTimer?.invalidate()
         pollTimer = nil
+        NSApp.setActivationPolicy(.accessory)
     }
 }
 
@@ -443,13 +698,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var statusMenuItem: NSMenuItem!
     private var toggleMenuItem: NSMenuItem!
+    private var shiftMenuItem: NSMenuItem!
     private var watchdogTimer: Timer?
     private var permissionGuide: PermissionGuideWindowController?
     private let launchedAt = Date()
     private var lastRebuildAt = Date.distantPast
 
     func applicationDidFinishLaunching(_: Notification) {
-        log("应用启动（登录项启动时 stderr 不可见，完整日志见 ~/Library/Logs/CapsJ4Mac.log）")
+        log("应用启动（登录项启动时 stderr 不可见，完整日志见 ~/Library/Logs/WASD.log）")
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(sessionBecameActive),
             name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil
@@ -465,9 +721,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: "CapsJ4Mac")
+            button.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: "WASD")
             button.image?.isTemplate = true
-            button.toolTip = "CapsJ4Mac"
+            button.toolTip = "WASD"
         }
 
         let menu = NSMenu()
@@ -479,6 +735,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleMenuItem = NSMenuItem(title: "", action: #selector(toggleRemapping), keyEquivalent: "")
         toggleMenuItem.target = self
         menu.addItem(toggleMenuItem)
+
+        shiftMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        shiftMenuItem.isEnabled = false
+        menu.addItem(shiftMenuItem)
         menu.addItem(.separator())
 
         let permissionItem = NSMenuItem(title: "权限设置…", action: #selector(openPermissionGuide), keyEquivalent: "")
@@ -486,7 +746,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(permissionItem)
         menu.addItem(.separator())
 
-        let quitItem = NSMenuItem(title: "退出 CapsJ4Mac", action: #selector(quit), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "退出 WASD", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
 
@@ -571,7 +831,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // tap 能看到 Caps 的 flagsChanged，HID 层却从未上报物理事件
         // -> IOHIDManager 打开时机过早，重开（测试模式由 tap 代管 Caps 状态，跳过）
-        if ProcessInfo.processInfo.environment["CAPSJ4MAC_TAP_STATE"] != "1",
+        if ProcessInfo.processInfo.environment["WASD_TAP_STATE"] != "1",
            controller.capsFlagsSeen > 0, controller.hidEventsSeen == 0 {
             log("看门狗：HID 层未上报 Caps 物理事件，重开 IOHIDManager")
             lastRebuildAt = Date()
@@ -602,16 +862,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !hasAllPermissions() {
             statusMenuItem.title = "状态：等待授权（点“权限设置”）…"
             toggleMenuItem.isEnabled = false
+            shiftMenuItem.title = "短按 Shift：等待授权"
             statusItem.button?.alphaValue = 0.35
         } else if controller.enabled {
             statusMenuItem.title = "状态：映射中（Caps+WASD/[/]）"
             toggleMenuItem.title = "暂停映射"
             toggleMenuItem.isEnabled = true
+            shiftMenuItem.title = "短按 Shift：切换中/英"
             statusItem.button?.alphaValue = 1.0
         } else {
             statusMenuItem.title = "状态：已暂停"
             toggleMenuItem.title = "恢复映射"
             toggleMenuItem.isEnabled = true
+            shiftMenuItem.title = "短按 Shift：已暂停"
             statusItem.button?.alphaValue = 0.35
         }
     }

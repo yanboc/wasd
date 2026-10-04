@@ -1,14 +1,14 @@
-APP := CapsJ4Mac.app
-BIN := $(APP)/Contents/MacOS/CapsJ4Mac
+APP := WASD.app
+BIN := $(APP)/Contents/MacOS/WASD
 
 # 自签名代码签名证书（make cert 生成）。固定身份让 TCC 权限跨构建、跨重启保持稳定；
 # 证书不存在时回退 ad-hoc 签名（--sign -），但每次重编译都可能要重新授权。
-CERT := CapsJ4Mac Signing
+CERT := WASD Signing
 SIGN := $(shell security find-identity -p codesigning 2>/dev/null | grep -q "$(CERT)" && echo "$(CERT)" || echo "-")
 
 build:
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
-	swiftc -O -import-objc-header Sources/CapsJ4Mac-Bridging-Header.h -o $(BIN) Sources/main.swift Sources/capslock.c -framework IOKit
+	swiftc -O -import-objc-header Sources/WASD-Bridging-Header.h -o $(BIN) Sources/main.swift Sources/capslock.c -framework IOKit -framework Carbon
 	cp Info.plist $(APP)/Contents/Info.plist
 	cp Resources/AppIcon.icns $(APP)/Contents/Resources/AppIcon.icns
 	codesign --sign "$(SIGN)" --force --deep $(APP)
@@ -43,14 +43,17 @@ run: build
 
 test: build
 	swiftc -O -o Tests/remap_test Tests/remap_test.swift
-	-pkill -x CapsJ4Mac; sleep 1
-	CAPSJ4MAC_TAP_STATE=1 nohup ./$(BIN) > /tmp/capsj4mac-test.log 2>&1 & sleep 2
-	./Tests/remap_test
-	-pkill -x CapsJ4Mac; sleep 1
-	nohup ./$(BIN) > /tmp/capsj4mac.log 2>&1 & sleep 1
-	@echo "测试完毕，已重启正式实例"
+	codesign --sign "$(SIGN)" --force --identifier local.wasd.remap-test Tests/remap_test
+	pkill -x WASD || true
+	pkill -x CapsJ4Mac || true
+	sleep 1
+	WASD_TAP_STATE=1 nohup ./$(BIN) > /tmp/wasd-test.log 2>&1 & sleep 2
+	./Tests/remap_test; status=$$?; \
+	pkill -x WASD || true; sleep 1; \
+	open $(APP); \
+	exit $$status
 
 clean:
-	rm -rf $(APP)
+	rm -rf $(APP) CapsJ4Mac.app
 
 .PHONY: build cert icon run test clean

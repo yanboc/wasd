@@ -3,11 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>local.capsj4mac</string>
+	<string>local.wasd</string>
 	<key>CFBundleName</key>
-	<string>CapsJ4Mac</string>
+	<string>WASD</string>
+	<key>CFBundleDisplayName</key>
+	<string>WASD</string>
 	<key>CFBundleExecutable</key>
-	<string>CapsJ4Mac</string>
+	<string>WASD</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleIconFile</key>
@@ -15,11 +17,9 @@
 	<key>CFBundleIconName</key>
 	<string>AppIcon</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1.0</string>
+	<string>1.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>2</string>
-	<key>LSUIElement</key>
-	<true/>
+	<string>3</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 </dict>

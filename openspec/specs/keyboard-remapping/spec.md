@@ -67,14 +67,34 @@
 
 ### Requirement: 未映射按键不受影响
 
-当 Caps Lock 按住时，不在映射表中的按键 MUST 原样放行；Caps Lock 未按住时，所有按键 MUST 完全不受影响。
+当 Caps Lock 按住时，不在映射表中的按键 MUST 原样放行。Caps Lock 未按住时，除「短按 Shift 切换中英文」外，按键 MUST 不受影响。
 
 #### Scenario: Caps+Q 输出原键
 
 - **WHEN** 用户按住 Caps Lock 按下 Q
 - **THEN** 当前应用正常收到 Q 键事件
 
-#### Scenario: 不按 Caps 时键盘行为完全正常
+#### Scenario: 不按 Caps 时普通输入保持原样
 
-- **WHEN** 用户未按住 Caps Lock 进行任何输入
-- **THEN** 所有按键行为与未安装本应用时一致（Shift 等其他修饰键完全透传）
+- **WHEN** 用户未按住 Caps Lock，按下字母或与 Command、Option、Control 组合
+- **THEN** 这些按键行为与未安装本应用时一致
+
+### Requirement: 短按 Shift 切换中英文
+
+映射启用时，单独短按左 Shift 或右 Shift SHALL 在当前中文输入源与英文输入源之间切换。一次短按是指按下到抬起短于 0.3 秒，且期间没有其他按键、鼠标键或其他修饰键。该次 Shift 事件 MUST 被吞掉，不传给当前应用，也不交给输入法再切一次。按住超过 0.3 秒，或与其他键组合时，Shift MUST 仍作为修饰键生效。映射暂停时，Shift MUST 完全恢复系统原生行为。
+
+#### Scenario: 短按 Shift 从中文切到英文
+
+- **WHEN** 映射启用，当前输入源是中文，用户单独短按 Shift
+- **THEN** 输入源切到上次使用的英文键盘布局（默认 ABC），当前应用不收到这次 Shift
+
+#### Scenario: 短按 Shift 从英文切回中文
+
+- **WHEN** 映射启用，当前输入源是英文，用户单独短按 Shift
+- **THEN** 输入源切回上次使用的中文输入源
+
+#### Scenario: Shift 组合键仍是修饰键
+
+- **WHEN** 用户按下 Shift 后在 0.3 秒内再按 F13，或按住 Shift 超过 0.3 秒
+- **THEN** 不切换输入源，目标键带 Shift 修饰
+
